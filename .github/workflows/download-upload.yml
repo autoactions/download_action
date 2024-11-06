@@ -6,28 +6,146 @@ on:
       download_url:
         description: '下载链接'
         required: true
+      custom_filename:
+        description: '自定义文件名（可选）'
+        required: false
+  repository_dispatch:
+    types: [download_file]
 
 jobs:
   transfer:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装 aria2 和 rclone
+      - name: 获取下载链接和文件名
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2
-          curl https://rclone.org/install.sh | sudo bash
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "DOWNLOAD_URL=${{ github.event.client_payload.download_url }}" >> $GITHUB_ENV
+            echo "CUSTOM_FILENAME=${{ github.event.client_payload.custom_filename }}" >> $GITHUB_ENV
+          else
+            echo "DOWNLOAD_URL=${{ github.event.inputs.download_url }}" >> $GITHUB_ENV
+            echo "CUSTOM_FILENAME=${{ github.event.inputs.custom_filename }}" >> $GITHUB_ENV
+          fi
+          
+      - name: 缓存 APT 包
+        uses: actions/cache@v3
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('**/apt-packages.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: 缓存 rclone
+        uses: actions/cache@v3
+        with:
+          path: |
+            /usr/bin/rclone
+            ~/.config/rclone
+          key: ${{ runner.os }}-rclone-${{ hashFiles('**/rclone.conf') }}
+          restore-keys: |
+            ${{ runner.os }}-rclone-
+
+      - name: 安装依赖
+        run: |
+          # 检查 rclone 是否已缓存
+          if ! command -v rclone &>/dev/null; then
+            echo "安装 rclone..."
+            curl https://rclone.org/install.sh | sudo bash
+          else
+            echo "使用缓存的 rclone"
+          fi
+
+          # 安装 aria2
+          if ! command -v aria2c &>/dev/null; then
+            echo "安装 aria2..."
+            sudo apt-get update
+            sudo apt-get install -y aria2
+          else
+            echo "使用缓存的 aria2"
+          fi
           
       - name: 配置 rclone
         run: |
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+          echo '${{ secrets.RCLONE_CONFIG }}' > ~/.config/rclone/rclone.conf
+          
+          if ! rclone config show &>/dev/null; then
+            echo "错误：rclone 配置无效"
+            exit 1
+          fi
           
       - name: 下载文件
+        id: download
         run: |
           mkdir -p downloads
           cd downloads
-          aria2c "${{ github.event.inputs.download_url }}"
+          
+          # 确定文件名
+          if [ -n "$CUSTOM_FILENAME" ]; then
+            FILENAME="$CUSTOM_FILENAME"
+          else
+            FILENAME=$(basename "$DOWNLOAD_URL" | sed 's/\?.*//')
+          fi
+          echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+          echo "下载文件名: $FILENAME"
+          
+          # 使用重试机制下载
+          for i in {1..3}; do
+            if aria2c --allow-overwrite=true \
+                     --max-connection-per-server=16 \
+                     --split=16 --min-split-size=1M \
+                     --connect-timeout=10 --timeout=600 \
+                     --auto-file-renaming=false \
+                     --out="$FILENAME" \
+                     "$DOWNLOAD_URL"; then
+              echo "下载成功！"
+              break
+            fi
+            
+            if [ $i -eq 3 ]; then
+              echo "下载失败，已重试3次"
+              exit 1
+            fi
+            echo "下载失败，等待10秒后重试..."
+            sleep 10
+          done
           
       - name: 上传到网盘
         run: |
-          rclone copy downloads/ remote:"${{ secrets.UPLOAD_PATH }}"
+          # 验证下载文件
+          if [ ! -f "downloads/$FILENAME" ]; then
+            echo "错误：文件 $FILENAME 不存在！"
+            exit 1
+          fi
+          
+          REMOTE="${{ secrets.REMOTE_NAME }}"
+          UPLOAD_PATH="${{ secrets.UPLOAD_PATH }}"
+          
+          # 清理路径（只去除首尾空格）
+          UPLOAD_PATH=$(echo "$UPLOAD_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          [[ "$UPLOAD_PATH" != /* ]] && UPLOAD_PATH="/$UPLOAD_PATH"
+          
+          echo "准备上传到: $REMOTE:$UPLOAD_PATH"
+          
+          # 上传文件并显示进度
+          if rclone copy --progress \
+                        --transfers 4 \
+                        --checkers 8 \
+                        --tpslimit 10 \
+                        --retries 3 \
+                        --low-level-retries 10 \
+                        --stats 1s \
+                        "downloads/$FILENAME" "$REMOTE:$UPLOAD_PATH"; then
+            echo "上传成功！文件位置："
+            echo "$REMOTE:$UPLOAD_PATH/$FILENAME"
+            
+            # 验证文件是否已上传
+            if rclone lsf "$REMOTE:$UPLOAD_PATH/$FILENAME" &>/dev/null; then
+              echo "文件验证成功！"
+            else
+              echo "警告：无法验证已上传的文件"
+              exit 1
+            fi
+          else
+            echo "上传失败！"
+            exit 1
+          fi
