@@ -1,0 +1,33 @@
+name: Download and Upload to Cloud Storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: '下载链接'
+        required: true
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装 aria2 和 rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+          curl https://rclone.org/install.sh | sudo bash
+          
+      - name: 配置 rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+          
+      - name: 下载文件
+        run: |
+          mkdir -p downloads
+          cd downloads
+          aria2c "${{ github.event.inputs.download_url }}"
+          
+      - name: 上传到网盘
+        run: |
+          rclone copy downloads/ remote:"${{ secrets.UPLOAD_PATH }}"
